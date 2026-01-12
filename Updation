@@ -1,0 +1,1475 @@
+# 🔧 Bot 1.3 Fix & Enhancement Blueprint - PART 1
+
+## 📋 Overview
+This blueprint contains step-by-step instructions to fix all issues in your Bot 1.3.
+
+---
+
+## ✅ ISSUE #1: Fix /uncategorized Command
+
+### Problem
+The `/uncategorized` command only works in admin panel buttons, not manually.
+
+### Location
+Find the `admin_uncategorized` function (around line 1800-1850)
+
+### Fix
+Replace the entire function with:
+
+```python
+async def admin_uncategorized(update, context):
+    """List all batches that don't belong to any category"""
+    # Support both query and update
+    if hasattr(update, 'callback_query') and update.callback_query:
+        query = update.callback_query
+        user_id = query.from_user.id
+        send_method = query.message.reply_text
+    else:
+        user_id = update.effective_user.id
+        send_method = update.message.reply_text
+    
+    if user_id not in [ADMIN_ID] + list(SUB_ADMINS):
+        return
+    
+    uncategorized = await get_uncategorized_batches()
+    
+    db = await get_db()
+    try:
+        if not uncategorized:
+            success_msg = format_message_header("ALL BATCHES CATEGORIZED", "✅")
+            success_msg += "All batches are assigned to categories!"
+            success_msg += format_message_footer()
+            
+            return await send_method(success_msg, parse_mode="HTML")
+        
+        report_text = format_message_header("UNCATEGORIZED BATCHES", "📂")
+        report_text += f"\n<b>Total:</b> {len(uncategorized)}\n\n"
+        
+        for batch in sorted(uncategorized):
+            async with db.execute(
+                "SELECT COUNT(*) as count FROM videos WHERE batch = ?",
+                (batch,)
+            ) as cursor:
+                video_count = (await cursor.fetchone())['count']
+            
+            report_text += f"• {batch} ({video_count} videos)\n"
+        
+        report_text += "\n" + format_message_footer()
+        report_text += "\n💡 Use /assignbatch to categorize them!"
+        
+        await send_method(report_text, parse_mode="HTML")
+    finally:
+        await release_db(db)
+```
+
+---
+
+## ✅ ISSUE #2: Fix /settime Button
+
+### Problem
+The change time button in settings doesn't work properly.
+
+### Location
+Find the callback handler section with `admin_settings:change_time` (around line 1350)
+
+### Fix
+Replace this section:
+
+```python
+elif setting_action == "change_time":
+    current_time = settings.get('auto_delete_seconds', 60)
+    
+    # Create quick time selection buttons
+    kb = [
+        [InlineKeyboardButton("30s", callback_data="admin_time:set:30"),
+         InlineKeyboardButton("60s", callback_data="admin_time:set:60")],
+        [InlineKeyboardButton("90s", callback_data="admin_time:set:90"),
+         InlineKeyboardButton("120s", callback_data="admin_time:set:120")],
+        [InlineKeyboardButton("180s", callback_data="admin_time:set:180"),
+         InlineKeyboardButton("300s", callback_data="admin_time:set:300")],
+        [InlineKeyboardButton("✏️ Custom Time", callback_data="admin_time:custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel:settings")]
+    ]
+    
+    time_text = format_message_header("SET AUTO DELETE TIME", "⏱️")
+    time_text += f"<b>Current:</b> {current_time}s\n\n"
+    time_text += "Select a quick option or choose Custom:"
+    time_text += format_message_footer()
+    
+    await edit_with_retry(
+        q,
+        time_text,
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="HTML"
+    )
+```
+
+### Add New Handler
+After the `admin_settings:` section, add this NEW handler:
+
+```python
+# ═══════════════════════════════════════════════════════════════
+# ⏱️ ADMIN TIME SETTINGS
+# ═══════════════════════════════════════════════════════════════
+elif data.startswith("admin_time:"):
+    if not is_admin(uid):
+        await q.answer("❌ Unauthorized!", show_alert=True)
+        return
+    
+    parts = data.split(":")
+    time_action = parts[1]
+    
+    if time_action == "set":
+        seconds = int(parts[2])
+        await update_bot_setting('auto_delete_seconds', seconds)
+        
+        await q.answer(f"✅ Auto delete time set to {seconds}s", show_alert=True)
+        
+        kb = await build_settings_menu()
+        settings_text = format_message_header("BOT SETTINGS", "⚙️")
+        settings_text += f"✅ Auto delete time: {seconds}s\n"
+        settings_text += format_message_footer()
+        
+        await edit_with_retry(
+            q,
+            settings_text,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+    
+    elif time_action == "custom":
+        pending_operations[uid] = {
+            'action': 'set_custom_time',
+            'step': 'waiting_time'
+        }
+        
+        info_text = format_message_header("CUSTOM TIME", "✏️")
+        info_text += "Reply with: <code>/settime &lt;seconds&gt;</code>\n\n"
+        info_text += "<b>Example:</b>\n<code>/settime 150</code>\n\n"
+        info_text += "⚠️ Range: 10-600 seconds"
+        info_text += format_message_footer()
+        
+        await q.message.reply_text(info_text, parse_mode="HTML")
+```
+
+---
+
+## ✅ ISSUE #3: Multiple Selection with Checkmarks
+
+### Problem
+Need visual feedback (✅) for selected items in batch operations.
+
+### Solution Overview
+We'll add a selection tracking system that shows ✅ for selected items.
+
+### Step 1: Add Selection Tracker
+Find the `pending_operations` global variable (around line 60) and add:
+
+```python
+pending_operations = {}  # For multi-step operations
+selected_items = {}  # Track selected items per user
+```
+
+### Step 2: Update Build Batch Selection Buttons
+Find `build_batch_selection_buttons` function (around line 850) and replace:
+
+```python
+async def build_batch_selection_buttons(category_name, action_prefix, allow_multiple=False):
+    """Build batch selection buttons for operations"""
+    batches = await get_batches_in_category(category_name)
+    
+    db = await get_db()
+    try:
+        kb = []
+        
+        # Get current user's selections if any
+        user_selections = selected_items.get(action_prefix, set())
+        
+        for batch in batches:
+            async with db.execute(
+                "SELECT COUNT(*) as count FROM videos WHERE batch = ?",
+                (batch,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                video_count = row['count']
+            
+            # Add checkmark if selected
+            is_selected = batch in user_selections
+            prefix = "✅ " if is_selected else ""
+            
+            kb.append([InlineKeyboardButton(
+                f"{prefix}📂 {batch} ({video_count} videos)",
+                callback_data=f"{action_prefix}:{batch}"
+            )])
+        
+        if allow_multiple and user_selections:
+            kb.append([InlineKeyboardButton(
+                f"✅ Confirm ({len(user_selections)} selected)", 
+                callback_data=f"{action_prefix}:confirm"
+            )])
+        
+        kb.append([InlineKeyboardButton("❌ Cancel", callback_data="admin_panel:batch_mgmt")])
+        return kb
+    finally:
+        await release_db(db)
+```
+
+### Step 3: Update Batch Deletion Handler
+Find the batch deletion callback section (around line 1650) and replace:
+
+```python
+# Handle batch deletion batch selection
+elif data.startswith("admin_batch_del_batch:"):
+    if not is_admin(uid):
+        await q.answer("❌ Unauthorized!", show_alert=True)
+        return
+    
+    batch = data.split(":", 1)[1]
+    
+    if batch == "confirm":
+        # Confirm deletion
+        user_key = f"admin_batch_del_batch:{uid}"
+        user_selections = selected_items.get(user_key, set())
+        
+        if not user_selections:
+            await q.answer("❌ No batches selected!", show_alert=True)
+            return
+        
+        kb = [
+            [InlineKeyboardButton("✅ YES, DELETE THEM", callback_data="admin_batch_del_confirm")],
+            [InlineKeyboardButton("❌ CANCEL", callback_data="admin_panel:batch_mgmt")]
+        ]
+        
+        confirm_text = format_message_header("CONFIRM DELETION", "⚠️")
+        confirm_text += f"\n<b>Batches to delete:</b>\n"
+        for b in user_selections:
+            confirm_text += f"  • {b}\n"
+        confirm_text += "\n⚠️ <b>WARNING:</b> This action cannot be undone!"
+        confirm_text += format_message_footer()
+        
+        await edit_with_retry(q, confirm_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    else:
+        # Toggle batch selection
+        op = pending_operations.get(uid)
+        if not op:
+            return
+        
+        category = op.get('category')
+        user_key = f"admin_batch_del_batch:{uid}"
+        
+        # Initialize selection set if not exists
+        if user_key not in selected_items:
+            selected_items[user_key] = set()
+        
+        # Toggle selection
+        if batch in selected_items[user_key]:
+            selected_items[user_key].remove(batch)
+            await q.answer(f"❌ Removed: {batch}", show_alert=False)
+        else:
+            selected_items[user_key].add(batch)
+            await q.answer(f"✅ Selected: {batch}", show_alert=False)
+        
+        # Rebuild keyboard
+        kb = await build_batch_selection_buttons(category, "admin_batch_del_batch", allow_multiple=True)
+        
+        info_text = format_message_header("DELETE BATCH", "🗑️")
+        info_text += f"Step 2: Select batches from <b>{category}</b>:\n\n"
+        info_text += f"<b>Selected:</b> {len(selected_items[user_key])}\n"
+        info_text += "Select multiple batches and click Confirm."
+        info_text += format_message_footer()
+        
+        await edit_with_retry(q, info_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+```
+
+### Step 4: Update Batch Deletion Confirm
+Find `admin_batch_del_confirm` (around line 1700):
+
+```python
+elif data == "admin_batch_del_confirm":
+    if not is_admin(uid):
+        await q.answer("❌ Unauthorized!", show_alert=True)
+        return
+    
+    user_key = f"admin_batch_del_batch:{uid}"
+    user_selections = selected_items.get(user_key, set())
+    
+    if not user_selections:
+        await q.answer("❌ No batches selected!", show_alert=True)
+        return
+    
+    # Delete batches
+    await delete_batches(list(user_selections), uid, context)
+    
+    # Clear selections
+    selected_items.pop(user_key, None)
+    pending_operations.pop(uid, None)
+    
+    await q.answer("✅ Batches deleted successfully!", show_alert=True)
+    
+    success_text = format_success_message(
+        f"Deleted {len(user_selections)} batch(es) successfully!"
+    )
+    await edit_with_retry(q, success_text, parse_mode="HTML")
+```
+
+---
+
+## 📝 Summary of Changes - Part 1
+
+1. ✅ Fixed `/uncategorized` command to work both manually and via button
+2. ✅ Fixed `/settime` button with quick selection options
+3. ✅ Added multiple selection system with visual checkmarks (✅)
+
+### Next Steps
+Continue to **Part 2** for:
+- Fixing animation settings
+- Adding start emoji animations
+- Adding contact admin animation settings
+
+Would you like me to continue with Part 2?
+
+# 🔧 Bot 1.3 Fix Blueprint - PART 2
+
+## ✅ ISSUE #4: Fix Animation Settings
+
+### Problem
+Animation settings show as changed but don't actually work. Need to add 🤖 (start) and 📞 (contact) animations.
+
+---
+
+### Step 1: Update Database Initialization
+
+Find the `init_database` function (around line 100) and update the emoji settings initialization:
+
+```python
+# Initialize default emojis
+await db.execute("""
+    INSERT OR IGNORE INTO emoji_settings (setting_type, setting_key, emoji) VALUES
+    ('file_type', 'video', '▶️'),
+    ('file_type', 'document', '📄'),
+    ('file_type', 'pdf', '📕'),
+    ('file_type', 'zip', '📦'),
+    ('file_type', 'txt', '📄'),
+    ('ui', 'home', '🏠'),
+    ('ui', 'search', '🔍'),
+    ('ui', 'stats', '📊'),
+    ('ui', 'subscriptions', '📬'),
+    ('ui', 'category', '📚'),
+    ('ui', 'batch', '📂'),
+    ('animation', 'loading', '🚀'),
+    ('animation', 'processing', '⏳'),
+    ('animation', 'search', '🔍'),
+    ('animation', 'stats', '📊'),
+    ('animation', 'start', '🤖'),
+    ('animation', 'contact', '📞')
+""")
+```
+
+---
+
+### Step 2: Fix show_animation Function
+
+Find the `show_animation` function (around line 400) and replace it:
+
+```python
+async def show_animation(context, chat_id, anim_type='loading'):
+    """Show animation if enabled"""
+    settings = await get_animation_settings()
+    
+    # Check global enabled
+    if not settings.get('global_enabled', True):
+        return None
+    
+    # Get animation config
+    anim = settings.get(anim_type)
+    if not anim or not anim.get('enabled', True):
+        return None
+    
+    emoji = anim.get('emoji', '🚀')
+    duration = anim.get('duration', 1.5)
+    
+    try:
+        # Send animation message
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=emoji,
+            parse_mode=None  # No HTML parsing for emoji
+        )
+        
+        # Wait for duration
+        await asyncio.sleep(duration)
+        
+        # Delete animation message
+        try:
+            await context.bot.delete_message(chat_id, msg.message_id)
+        except:
+            pass  # Ignore if already deleted
+        
+        return True
+    except Exception as e:
+        logging.error(f"[ANIMATION] Error showing {anim_type}: {e}")
+        return None
+```
+
+---
+
+### Step 3: Update get_animation_settings Function
+
+Find `get_animation_settings` (around line 380) and replace:
+
+```python
+async def get_animation_settings():
+    """Get animation settings from database"""
+    db = await get_db()
+    try:
+        settings = {}
+        
+        # Get global enabled setting
+        async with db.execute(
+            "SELECT value FROM bot_settings WHERE key = 'animations_enabled'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            settings['global_enabled'] = row['value'] == 'true' if row else True
+        
+        # Get all animation emojis
+        async with db.execute(
+            "SELECT setting_key, emoji FROM emoji_settings WHERE setting_type = 'animation'"
+        ) as cursor:
+            async for row in cursor:
+                anim_type = row['setting_key']
+                settings[anim_type] = {'emoji': row['emoji']}
+        
+        # Get duration and enabled for each animation type
+        for anim_type in ['loading', 'processing', 'search', 'stats', 'start', 'contact']:
+            # Duration
+            async with db.execute(
+                "SELECT value FROM bot_settings WHERE key = ?",
+                (f'animation_{anim_type}_duration',)
+            ) as cursor:
+                row = await cursor.fetchone()
+                duration = float(row['value']) if row else 1.5
+            
+            # Enabled status
+            async with db.execute(
+                "SELECT value FROM bot_settings WHERE key = ?",
+                (f'animation_{anim_type}_enabled',)
+            ) as cursor:
+                row = await cursor.fetchone()
+                enabled = row['value'] == 'true' if row else True
+            
+            # Get emoji if not already set
+            if anim_type not in settings:
+                async with db.execute(
+                    "SELECT emoji FROM emoji_settings WHERE setting_type = 'animation' AND setting_key = ?",
+                    (anim_type,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    emoji = row['emoji'] if row else '🚀'
+                    settings[anim_type] = {'emoji': emoji}
+            
+            # Add duration and enabled
+            settings[anim_type]['duration'] = duration
+            settings[anim_type]['enabled'] = enabled
+        
+        return settings
+    finally:
+        await release_db(db)
+```
+
+---
+
+### Step 4: Update Animation Settings Menu
+
+Find `build_animation_settings_menu` (around line 790) and replace:
+
+```python
+async def build_animation_settings_menu():
+    """Build animation settings menu"""
+    settings = await get_animation_settings()
+    
+    global_status = "✅ ON" if settings.get('global_enabled') else "❌ OFF"
+    
+    kb = [
+        [InlineKeyboardButton(f"🎭 Global Animations: {global_status}", callback_data="admin_anim:toggle_global")],
+    ]
+    
+    anim_names = {
+        'loading': 'Loading',
+        'processing': 'Processing', 
+        'search': 'Search',
+        'stats': 'Stats',
+        'start': 'Start Command',
+        'contact': 'Contact Admin'
+    }
+    
+    for anim_type, display_name in anim_names.items():
+        anim = settings.get(anim_type, {})
+        emoji = anim.get('emoji', '🚀')
+        duration = anim.get('duration', 1.5)
+        enabled = anim.get('enabled', True)
+        status = "✅" if enabled else "❌"
+        
+        kb.append([InlineKeyboardButton(
+            f"{emoji} {display_name}: {status} ({duration}s)",
+            callback_data=f"admin_anim:edit:{anim_type}"
+        )])
+    
+    kb.append([InlineKeyboardButton("🔙 Back to System & Settings", callback_data="admin_panel:system_settings")])
+    
+    return kb
+```
+
+---
+
+### Step 5: Update Start Command to Use Animation
+
+Find `cmd_start_handler` function (around line 2200) and replace the animation part:
+
+```python
+async def cmd_start_handler(update, context):
+    """Actual start handler"""
+    u = await ensure_user(update, context)
+    
+    if u.get("blocked"):
+        return await send_with_retry(
+            context,
+            update.effective_chat.id,
+            format_error_message("Your account has been blocked by Admin."),
+            parse_mode="HTML"
+        )
+    
+    # Show start animation
+    await show_animation(context, update.effective_chat.id, 'start')
+    
+    full_name = u.get("username", "User")
+    
+    home_emoji = await get_emoji('ui', 'home', '🏠')
+    welcome_txt = format_message_header(f"Welcome, {full_name}!", "👋")
+    welcome_txt += f"\n{home_emoji} <b>{BOT_DISPLAY_NAME}</b>\n"
+    welcome_txt += "━━━━━━━━━━━━━━━━━━\n"
+    welcome_txt += "<b>📖 HOW TO USE THIS BOT:</b>\n\n"
+    welcome_txt += "1️⃣ <b>Browse Categories:</b> Select any category below to see batches\n"
+    welcome_txt += "2️⃣ <b>Recent Videos:</b> Click '🕒 Recent' in any batch for latest uploads\n"
+    welcome_txt += "3️⃣ <b>Search:</b> Use '🔍 Search Video' to find specific content\n"
+    welcome_txt += "4️⃣ <b>Subscribe:</b> Get notified when new videos are added to your favorite batches\n"
+    welcome_txt += "5️⃣ <b>Daily Bonus:</b> Use /bonus command for +3 extra downloads daily\n\n"
+    welcome_txt += f"📊 <b>Your Daily Limit:</b> {u.get('daily_limit', 5)} + {u.get('extra_granted', 0)} extra\n"
+    welcome_txt += "━━━━━━━━━━━━━━━━━━\n"
+    welcome_txt += "Select a category below to get started! 👇"
+    welcome_txt += format_message_footer()
+    
+    menu_kb = await build_main_menu()
+    await send_with_retry(
+        context,
+        update.effective_chat.id,
+        welcome_txt,
+        reply_markup=InlineKeyboardMarkup(menu_kb),
+        parse_mode="HTML"
+    )
+```
+
+---
+
+### Step 6: Update Contact Admin to Use Animation
+
+Find the contact admin callback (around line 1550) and replace:
+
+```python
+elif data == "contact_admin":
+    # Show contact animation
+    await show_animation(context, q.message.chat_id, 'contact')
+    
+    kb = [
+        [InlineKeyboardButton("💬 Message Admin", url=f"https://t.me/{BOT_USERNAME}")],
+        [InlineKeyboardButton("🏠 Home", callback_data="home")]
+    ]
+    
+    contact_text = format_message_header("CONTACT ADMIN", "📞")
+    contact_text += "Click the button below to message us:"
+    contact_text += format_message_footer()
+    
+    await edit_with_retry(
+        q,
+        contact_text,
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="HTML"
+    )
+```
+
+---
+
+### Step 7: Add Missing Animation Initialize
+
+Find the database initialization for animation settings and ensure these are added:
+
+```python
+# In init_database function, add these to bot_settings:
+await db.execute("""
+    INSERT OR IGNORE INTO bot_settings (key, value) VALUES 
+    ('animation_start_duration', '1.5'),
+    ('animation_start_enabled', 'true'),
+    ('animation_contact_duration', '1.0'),
+    ('animation_contact_enabled', 'true')
+""")
+```
+
+---
+
+## 📝 Summary of Changes - Part 2
+
+1. ✅ Fixed animation system to actually work
+2. ✅ Added 'start' animation (🤖) for /start command
+3. ✅ Added 'contact' animation (📞) for contact admin
+4. ✅ All animations now properly show/hide based on settings
+5. ✅ Duration and emoji changes now work correctly
+
+### Next Steps
+Continue to **Part 3** for:
+- Adding bot status indicators in /start message
+- Multiple caption design templates
+
+Would you like me to continue with Part 3?
+
+# 🔧 Bot 1.3 Fix Blueprint - PART 3
+
+## ✅ ISSUE #5: Add Bot Status in /start Message
+
+### Problem
+Need to show Forward Protection and Auto Delete status in start message.
+
+---
+
+### Step 1: Update Start Command Handler
+
+Find `cmd_start_handler` (around line 2200) and replace with this enhanced version:
+
+```python
+async def cmd_start_handler(update, context):
+    """Actual start handler"""
+    u = await ensure_user(update, context)
+    
+    if u.get("blocked"):
+        return await send_with_retry(
+            context,
+            update.effective_chat.id,
+            format_error_message("Your account has been blocked by Admin."),
+            parse_mode="HTML"
+        )
+    
+    # Show start animation
+    await show_animation(context, update.effective_chat.id, 'start')
+    
+    # Get bot settings for status
+    settings = await get_bot_settings()
+    protect_status = "🔒 ON" if settings.get('protect_content') else "🔓 OFF"
+    auto_delete_enabled = settings.get('auto_delete', True)
+    auto_delete_time = settings.get('auto_delete_seconds', 60)
+    
+    if auto_delete_enabled:
+        delete_status = f"✅ ON ({auto_delete_time}s)"
+    else:
+        delete_status = "❌ OFF"
+    
+    full_name = u.get("username", "User")
+    
+    home_emoji = await get_emoji('ui', 'home', '🏠')
+    welcome_txt = format_message_header(f"Welcome, {full_name}!", "👋")
+    welcome_txt += f"\n{home_emoji} <b>{BOT_DISPLAY_NAME}</b>\n"
+    welcome_txt += "━━━━━━━━━━━━━━━━━━\n"
+    
+    # Bot Status Section
+    welcome_txt += "<b>🤖 BOT STATUS:</b>\n"
+    welcome_txt += f"  ├─ Forward Protection: {protect_status}\n"
+    welcome_txt += f"  └─ Auto Delete: {delete_status}\n\n"
+    
+    welcome_txt += "<b>📖 HOW TO USE THIS BOT:</b>\n\n"
+    welcome_txt += "1️⃣ <b>Browse Categories:</b> Select any category below to see batches\n"
+    welcome_txt += "2️⃣ <b>Recent Videos:</b> Click '🕒 Recent' in any batch for latest uploads\n"
+    welcome_txt += "3️⃣ <b>Search:</b> Use '🔍 Search Video' to find specific content\n"
+    welcome_txt += "4️⃣ <b>Subscribe:</b> Get notified when new videos are added to your favorite batches\n"
+    welcome_txt += "5️⃣ <b>Daily Bonus:</b> Use /bonus command for +3 extra downloads daily\n\n"
+    welcome_txt += f"📊 <b>Your Daily Limit:</b> {u.get('daily_limit', 5)} + {u.get('extra_granted', 0)} extra\n"
+    welcome_txt += "━━━━━━━━━━━━━━━━━━\n"
+    welcome_txt += "Select a category below to get started! 👇"
+    welcome_txt += format_message_footer()
+    
+    menu_kb = await build_main_menu()
+    await send_with_retry(
+        context,
+        update.effective_chat.id,
+        welcome_txt,
+        reply_markup=InlineKeyboardMarkup(menu_kb),
+        parse_mode="HTML"
+    )
+```
+
+---
+
+## ✅ ISSUE #6: Multiple Caption Design Templates
+
+### Problem
+Need multiple caption design templates that can be selected by admin.
+
+---
+
+### Step 1: Add Caption Design Templates
+
+Add this NEW section after the `format_video_caption` function (around line 350):
+
+```python
+# ═══════════════════════════════════════════════════════════════
+# 🎨 CAPTION DESIGN TEMPLATES
+# ═══════════════════════════════════════════════════════════════
+
+CAPTION_TEMPLATES = {
+    "classic_box": {
+        "name": "Classic Box Design",
+        "description": "Original box design with borders"
+    },
+    "minimal": {
+        "name": "Minimal Clean",
+        "description": "Simple and clean layout"
+    },
+    "modern_card": {
+        "name": "Modern Card",
+        "description": "Card-style modern design"
+    },
+    "elegant": {
+        "name": "Elegant Premium",
+        "description": "Premium elegant style"
+    },
+    "compact": {
+        "name": "Compact Info",
+        "description": "Space-efficient compact view"
+    },
+    "detailed": {
+        "name": "Detailed View",
+        "description": "Full information display"
+    },
+    "gradient": {
+        "name": "Gradient Style",
+        "description": "Colorful gradient design"
+    }
+}
+
+def format_video_caption_template(original_caption, batch_name, settings, template="classic_box"):
+    """
+    Format video caption with selected template
+    
+    Templates:
+    - classic_box: Original box design
+    - minimal: Clean minimal layout
+    - modern_card: Card-style design
+    - elegant: Premium elegant style
+    - compact: Space-efficient view
+    - detailed: Full detailed view
+    - gradient: Colorful gradient style
+    """
+    if not original_caption:
+        return original_caption
+    
+    # Parse caption components
+    lines = original_caption.split('\n')
+    title_lines = []
+    date_line = None
+    extracted_line = None
+    batch_detected = batch_name
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        
+        if re.search(r'[Bb]atch\s*[:-]?\s*(.+)', line_stripped):
+            match = re.search(r'[Bb]atch\s*[:-]?\s*(.+)', line_stripped)
+            batch_detected = match.group(1).strip()
+            continue
+        
+        if re.search(r'[Dd]ate\s*[:-]?\s*(.+)', line_stripped):
+            match = re.search(r'[Dd]ate\s*[:-]?\s*(.+)', line_stripped)
+            date_line = match.group(1).strip()
+            continue
+        
+        if re.search(r'[Ee]xtracted\s+by\s*[:-]?\s*(.+)', line_stripped):
+            match = re.search(r'[Ee]xtracted\s+by\s*[:-]?\s*(.+)', line_stripped)
+            extracted_line = match.group(1).strip()
+            continue
+        
+        title_lines.append(line_stripped)
+    
+    # Auto-footer setting
+    if not extracted_line and settings.get('auto_footer', True):
+        extracted_line = settings.get('footer_name', 'Team Bot')
+    
+    # Apply template
+    if template == "classic_box":
+        return _template_classic_box(batch_detected, title_lines, date_line, extracted_line)
+    elif template == "minimal":
+        return _template_minimal(batch_detected, title_lines, date_line, extracted_line)
+    elif template == "modern_card":
+        return _template_modern_card(batch_detected, title_lines, date_line, extracted_line)
+    elif template == "elegant":
+        return _template_elegant(batch_detected, title_lines, date_line, extracted_line)
+    elif template == "compact":
+        return _template_compact(batch_detected, title_lines, date_line, extracted_line)
+    elif template == "detailed":
+        return _template_detailed(batch_detected, title_lines, date_line, extracted_line)
+    elif template == "gradient":
+        return _template_gradient(batch_detected, title_lines, date_line, extracted_line)
+    else:
+        return _template_classic_box(batch_detected, title_lines, date_line, extracted_line)
+
+
+def _template_classic_box(batch, titles, date, extracted):
+    """Classic box design (original)"""
+    formatted = []
+    batch_upper = batch.upper()
+    box_width = max(len(batch_upper) + 10, 25)
+    
+    formatted.append("┏" + "━" * box_width + "┓")
+    formatted.append(f"┃     📚 {batch_upper.center(box_width - 8)}┃")
+    formatted.append("┗" + "━" * box_width + "┛")
+    
+    if titles:
+        formatted.append("")
+        for i, title in enumerate(titles):
+            if i == 0:
+                formatted.append(f"📖 {title}")
+            else:
+                formatted.append(f"   {title}")
+    
+    if date:
+        formatted.append("")
+        formatted.append(f"📅 Date: {date}")
+    
+    if extracted:
+        formatted.append("")
+        formatted.append(f"👤 Extracted by: {extracted}")
+    
+    formatted.append("")
+    formatted.append("━" * box_width)
+    
+    return '\n'.join(formatted)
+
+
+def _template_minimal(batch, titles, date, extracted):
+    """Minimal clean design"""
+    formatted = []
+    
+    formatted.append(f"📚 <b>{batch}</b>")
+    formatted.append("")
+    
+    if titles:
+        for title in titles:
+            formatted.append(title)
+    
+    formatted.append("")
+    info_parts = []
+    if date:
+        info_parts.append(f"📅 {date}")
+    if extracted:
+        info_parts.append(f"👤 {extracted}")
+    
+    if info_parts:
+        formatted.append(" | ".join(info_parts))
+    
+    return '\n'.join(formatted)
+
+
+def _template_modern_card(batch, titles, date, extracted):
+    """Modern card style"""
+    formatted = []
+    
+    formatted.append("╭─────────────────────╮")
+    formatted.append(f"│  📚 <b>{batch}</b>")
+    formatted.append("├─────────────────────┤")
+    
+    if titles:
+        formatted.append("│")
+        for title in titles:
+            formatted.append(f"│  📖 {title}")
+    
+    if date or extracted:
+        formatted.append("├─────────────────────┤")
+        if date:
+            formatted.append(f"│  📅 {date}")
+        if extracted:
+            formatted.append(f"│  👤 {extracted}")
+    
+    formatted.append("╰─────────────────────╯")
+    
+    return '\n'.join(formatted)
+
+
+def _template_elegant(batch, titles, date, extracted):
+    """Elegant premium style"""
+    formatted = []
+    
+    formatted.append("═══════════════════════")
+    formatted.append(f"     📚 <b>{batch.upper()}</b>")
+    formatted.append("═══════════════════════")
+    formatted.append("")
+    
+    if titles:
+        for i, title in enumerate(titles):
+            if i == 0:
+                formatted.append(f"◈ <b>{title}</b>")
+            else:
+                formatted.append(f"  {title}")
+        formatted.append("")
+    
+    if date:
+        formatted.append(f"◆ Date: {date}")
+    if extracted:
+        formatted.append(f"◆ By: {extracted}")
+    
+    formatted.append("")
+    formatted.append("═══════════════════════")
+    
+    return '\n'.join(formatted)
+
+
+def _template_compact(batch, titles, date, extracted):
+    """Compact space-efficient"""
+    formatted = []
+    
+    formatted.append(f"📚 <b>{batch}</b>")
+    
+    if titles:
+        formatted.append(f"📖 {' • '.join(titles)}")
+    
+    info_parts = []
+    if date:
+        info_parts.append(f"📅{date}")
+    if extracted:
+        info_parts.append(f"👤{extracted}")
+    
+    if info_parts:
+        formatted.append(" │ ".join(info_parts))
+    
+    return '\n'.join(formatted)
+
+
+def _template_detailed(batch, titles, date, extracted):
+    """Detailed full information"""
+    formatted = []
+    
+    formatted.append("▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓")
+    formatted.append(f"📚 <b>BATCH INFORMATION</b>")
+    formatted.append("▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓")
+    formatted.append("")
+    formatted.append(f"📂 Batch Name: <b>{batch}</b>")
+    formatted.append("")
+    
+    if titles:
+        formatted.append("📖 <b>Content:</b>")
+        for i, title in enumerate(titles, 1):
+            formatted.append(f"   {i}. {title}")
+        formatted.append("")
+    
+    if date:
+        formatted.append(f"📅 <b>Date:</b> {date}")
+    if extracted:
+        formatted.append(f"👤 <b>Extracted by:</b> {extracted}")
+    
+    formatted.append("")
+    formatted.append("▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓")
+    
+    return '\n'.join(formatted)
+
+
+def _template_gradient(batch, titles, date, extracted):
+    """Colorful gradient style"""
+    formatted = []
+    
+    formatted.append("░░░░░░░░░░░░░░░░░░░░░")
+    formatted.append(f"▓▓ 📚 <b>{batch}</b> ▓▓")
+    formatted.append("░░░░░░░░░░░░░░░░░░░░░")
+    formatted.append("")
+    
+    if titles:
+        for title in titles:
+            formatted.append(f"▸ {title}")
+        formatted.append("")
+    
+    info_line = []
+    if date:
+        info_line.append(f"📅 {date}")
+    if extracted:
+        info_line.append(f"👤 {extracted}")
+    
+    if info_line:
+        formatted.append(" ◆ ".join(info_line))
+    
+    formatted.append("")
+    formatted.append("░░░░░░░░░░░░░░░░░░░░░")
+    
+    return '\n'.join(formatted)
+```
+
+---
+
+### Step 2: Update format_video_caption Function
+
+Find and replace the `format_video_caption` function (around line 350):
+
+```python
+def format_video_caption(original_caption, batch_name, settings):
+    """
+    Smart caption formatter with template support
+    """
+    if not original_caption:
+        return original_caption
+    
+    # Get selected template (default: classic_box)
+    template = settings.get('caption_template', 'classic_box')
+    
+    # Use template formatter
+    return format_video_caption_template(original_caption, batch_name, settings, template)
+```
+
+---
+
+### Step 3: Add Caption Template Selection to Database
+
+In `init_database` function, add this setting:
+
+```python
+await db.execute("""
+    INSERT OR IGNORE INTO bot_settings (key, value) VALUES 
+    ('caption_template', 'classic_box')
+""")
+```
+
+---
+
+### Step 4: Create Caption Template Selection Menu
+
+Add this new function after `build_design_settings_menu`:
+
+```python
+async def build_caption_template_menu():
+    """Build caption template selection menu"""
+    settings = await get_bot_settings()
+    current_template = settings.get('caption_template', 'classic_box')
+    
+    kb = []
+    
+    for template_id, template_info in CAPTION_TEMPLATES.items():
+        is_current = "✅ " if template_id == current_template else ""
+        kb.append([InlineKeyboardButton(
+            f"{is_current}{template_info['name']}",
+            callback_data=f"admin_template:select:{template_id}"
+        )])
+    
+    kb.append([InlineKeyboardButton("🔍 Preview All", callback_data="admin_template:preview_all")])
+    kb.append([InlineKeyboardButton("🔙 Back to Design Settings", callback_data="admin_panel:design_settings")])
+    
+    return kb
+```
+
+---
+
+### Step 5: Update Design Settings Menu
+
+Find `build_design_settings_menu` and update it:
+
+```python
+async def build_design_settings_menu():
+    """Build design settings menu"""
+    settings = await get_design_settings()
+    
+    design_status = "✅ ON" if settings.get('caption_design') else "❌ OFF"
+    footer_status = "✅ ON" if settings.get('auto_footer') else "❌ OFF"
+    footer_name = settings.get('footer_name', 'Team Bot')
+    
+    # Get current template
+    full_settings = await get_bot_settings()
+    current_template = full_settings.get('caption_template', 'classic_box')
+    template_name = CAPTION_TEMPLATES.get(current_template, {}).get('name', 'Classic Box')
+    
+    kb = [
+        [InlineKeyboardButton(f"🎨 Caption Design: {design_status}", callback_data="admin_design:toggle_design")],
+        [InlineKeyboardButton(f"📐 Template: {template_name}", callback_data="admin_design:templates")],
+        [InlineKeyboardButton(f"👤 Auto Footer: {footer_status}", callback_data="admin_design:toggle_footer")],
+        [InlineKeyboardButton(f"✏️ Footer Name: {footer_name}", callback_data="admin_design:change_name")],
+        [InlineKeyboardButton("🔍 Preview Design", callback_data="admin_design:preview")],
+        [InlineKeyboardButton("🔙 Back to System & Settings", callback_data="admin_panel:system_settings")]
+    ]
+    return kb
+```
+
+---
+
+### Step 6: Add Template Selection Callbacks
+
+Add this NEW handler in the callback_handler function (after admin_design handlers):
+
+```python
+# ═══════════════════════════════════════════════════════════════
+# 🎨 CAPTION TEMPLATE CALLBACKS
+# ═══════════════════════════════════════════════════════════════
+elif data.startswith("admin_template:"):
+    if not is_admin(uid):
+        await q.answer("❌ Unauthorized!", show_alert=True)
+        return
+    
+    parts = data.split(":")
+    template_action = parts[1]
+    
+    if template_action == "select":
+        template_id = parts[2]
+        await update_bot_setting('caption_template', template_id)
+        
+        template_name = CAPTION_TEMPLATES.get(template_id, {}).get('name', template_id)
+        await q.answer(f"✅ Template changed to {template_name}", show_alert=True)
+        
+        kb = await build_caption_template_menu()
+        
+        template_text = format_message_header("SELECT CAPTION TEMPLATE", "📐")
+        template_text += f"<b>Current:</b> {template_name}\n\n"
+        template_text += "Choose a template design:"
+        template_text += format_message_footer()
+        
+        await edit_with_retry(
+            q,
+            template_text,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+    
+    elif template_action == "preview_all":
+        settings = await get_design_settings()
+        full_settings = await get_bot_settings()
+        full_settings.update(settings)
+        
+        sample_caption = "Introduction to Quantum Physics\n\nDate: 10/01/2026\nBatch: Physics Mastery"
+        
+        preview_text = format_message_header("CAPTION TEMPLATES PREVIEW", "🔍")
+        preview_text += "\n"
+        
+        for template_id, template_info in CAPTION_TEMPLATES.items():
+            preview = format_video_caption_template(
+                sample_caption, 
+                "Physics Mastery", 
+                full_settings, 
+                template_id
+            )
+            
+            preview_text += f"<b>📐 {template_info['name']}</b>\n"
+            preview_text += f"<i>{template_info['description']}</i>\n"
+            preview_text += f"<pre>{preview}</pre>\n\n"
+        
+        preview_text += format_message_footer()
+        
+        await q.message.reply_text(preview_text, parse_mode="HTML")
+
+elif data == "admin_design:templates":
+    if not is_admin(uid):
+        await q.answer("❌ Unauthorized!", show_alert=True)
+        return
+    
+    kb = await build_caption_template_menu()
+    
+    settings = await get_bot_settings()
+    current_template = settings.get('caption_template', 'classic_box')
+    template_name = CAPTION_TEMPLATES.get(current_template, {}).get('name', 'Classic Box')
+    
+    template_text = format_message_header("SELECT CAPTION TEMPLATE", "📐")
+    template_text += f"<b>Current:</b> {template_name}\n\n"
+    template_text += "Choose a template design:"
+    template_text += format_message_footer()
+    
+    await edit_with_retry(
+        q,
+        template_text,
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="HTML"
+    )
+```
+
+---
+
+## 📝 Summary of Changes - Part 3
+
+1. ✅ Added bot status (Forward Protection + Auto Delete) in /start message
+2. ✅ Created 7 different caption design templates
+3. ✅ Added template selection system in admin panel
+4. ✅ Added preview feature for all templates
+
+### All Issues Fixed! ✅
+
+All 6 issues from your requirements have been addressed:
+1. ✅ `/uncategorized` command fixed
+2. ✅ `/settime` button working
+3. ✅ Multiple selection with checkmarks (✅)
+4. ✅ Animation settings fully functional
+5. ✅ Bot status in start message
+6. ✅ Multiple caption design templates
+
+### Final Implementation Notes
+
+- Copy all code changes from Parts 1, 2, and 3
+- Make changes in the exact order specified
+- Test each section after implementing
+- Backup your current code before making changes
+
+Need any clarification or have questions about any part? Let me know!
+
+# 🔧 Bot 1.3 Fix Blueprint - INDEX & QUICK GUIDE
+
+## 📚 Blueprint Overview
+
+This blueprint is divided into 3 parts to fix all issues in your Bot 1.3:
+
+---
+
+## 📖 PART 1: Core Fixes
+**File:** Bot 1.3 Fix Blueprint - Part 1
+
+### Issues Fixed:
+- ✅ **Issue #1:** `/uncategorized` command not working manually
+- ✅ **Issue #2:** `/settime` button not functioning
+- ✅ **Issue #3:** Multiple selection with checkmarks (✅)
+
+### Sections:
+1. Fix `admin_uncategorized` function (line ~1800)
+2. Fix settime callback handler (line ~1350)
+3. Add selection tracker system
+4. Update batch selection buttons
+5. Update batch deletion handlers
+
+**Estimated Time:** 15-20 minutes
+
+---
+
+## 📖 PART 2: Animation Fixes
+**File:** Bot 1.3 Fix Blueprint - Part 2
+
+### Issues Fixed:
+- ✅ **Issue #4:** Animation settings not working properly
+- ✅ Add 🤖 (start) animation
+- ✅ Add 📞 (contact) animation
+
+### Sections:
+1. Update database initialization (line ~100)
+2. Fix `show_animation` function (line ~400)
+3. Fix `get_animation_settings` function (line ~380)
+4. Update animation settings menu (line ~790)
+5. Update start command with animation (line ~2200)
+6. Update contact admin with animation (line ~1550)
+
+**Estimated Time:** 20-25 minutes
+
+---
+
+## 📖 PART 3: Status & Design Templates
+**File:** Bot 1.3 Fix Blueprint - Part 3
+
+### Issues Fixed:
+- ✅ **Issue #5:** Add bot status in /start message
+- ✅ **Issue #6:** Multiple caption design templates
+
+### Sections:
+1. Update start command with status display (line ~2200)
+2. Add 7 caption design templates (after line ~350)
+3. Create template selection system
+4. Add template preview feature
+5. Update design settings menu
+
+**Estimated Time:** 30-35 minutes
+
+---
+
+## 🚀 Quick Implementation Guide
+
+### Step 1: Backup Your Code
+```bash
+cp Bot_1.3.txt Bot_1.3_backup.txt
+```
+
+### Step 2: Implement Part 1
+1. Open Part 1 blueprint
+2. Follow each fix in order
+3. Test `/uncategorized`, `/settime`, and batch deletion
+
+### Step 3: Implement Part 2
+1. Open Part 2 blueprint
+2. Follow each fix in order
+3. Test animation settings and new animations
+
+### Step 4: Implement Part 3
+1. Open Part 3 blueprint
+2. Follow each fix in order
+3. Test start message and caption templates
+
+### Step 5: Final Testing
+```python
+# Test all commands:
+/start          # Check bot status display
+/uncategorized  # Should work manually now
+/adminpanel     # Check settime button
+# Test batch deletion with checkmarks
+# Test animation settings (loading, start, contact, etc.)
+# Test caption template selection
+```
+
+---
+
+## 📝 Implementation Checklist
+
+### Part 1 - Core Fixes
+- [ ] Fixed `/uncategorized` function
+- [ ] Fixed `/settime` callback
+- [ ] Added selection tracker
+- [ ] Updated batch selection buttons
+- [ ] Updated deletion handlers
+- [ ] Tested manual `/uncategorized`
+- [ ] Tested settime button
+- [ ] Tested batch selection with ✅
+
+### Part 2 - Animation Fixes
+- [ ] Updated database init
+- [ ] Fixed `show_animation`
+- [ ] Fixed `get_animation_settings`
+- [ ] Updated animation menu
+- [ ] Added start animation
+- [ ] Added contact animation
+- [ ] Tested all animations work
+- [ ] Tested animation toggle
+- [ ] Tested animation duration change
+
+### Part 3 - Status & Templates
+- [ ] Updated start message with status
+- [ ] Added 7 caption templates
+- [ ] Added template selection
+- [ ] Added template preview
+- [ ] Tested start message display
+- [ ] Tested all 7 templates
+- [ ] Tested template switching
+
+---
+
+## ⚠️ Important Notes
+
+### Do NOT Remove:
+- ❌ Existing commands
+- ❌ Existing features
+- ❌ UI designs
+- ❌ Database structure
+- ❌ Other working code
+
+### DO Add/Replace:
+- ✅ Only the specific functions mentioned
+- ✅ New handlers in correct locations
+- ✅ Database settings additions
+- ✅ Template system code
+
+---
+
+## 🔍 Finding Code Locations
+
+### Method 1: Line Numbers
+Each blueprint provides approximate line numbers:
+- Line ~100 = Near database init
+- Line ~350 = Near caption formatter
+- Line ~1350 = Near settings callbacks
+- Line ~2200 = Near start command
+
+### Method 2: Function Names
+Search for function names like:
+- `admin_uncategorized`
+- `cmd_settime`
+- `show_animation`
+- `format_video_caption`
+- `cmd_start_handler`
+
+### Method 3: Section Comments
+Look for comment sections like:
+```python
+# ═══════════════════════════════════════
+# 🔧 ADMIN SETTINGS CALLBACKS
+# ═══════════════════════════════════════
+```
+
+---
+
+## 🆘 Troubleshooting
+
+### If `/uncategorized` still doesn't work:
+- Check you updated the entire function
+- Verify it handles both `callback_query` and regular `update`
+
+### If animations don't work:
+- Check database initialization ran
+- Verify `show_animation` was updated
+- Test with `/animationstatus` command
+
+### If templates don't show:
+- Check CAPTION_TEMPLATES is added
+- Verify all template functions are present
+- Check template callback handler is added
+
+### If selections don't show ✅:
+- Verify `selected_items` global variable exists
+- Check `build_batch_selection_buttons` was updated
+- Test with batch deletion feature
+
+---
+
+## 📊 Testing Matrix
+
+| Feature | Test Command | Expected Result |
+|---------|-------------|-----------------|
+| Uncategorized | `/uncategorized` | Shows list |
+| Set Time | Admin Panel → Settings → Change Time | Shows time options |
+| Batch Delete | Admin Panel → Delete Batch | Shows ✅ on selection |
+| Start Animation | `/start` | Shows 🤖 animation |
+| Contact Animation | Contact Admin Button | Shows 📞 animation |
+| Bot Status | `/start` | Shows Forward + Delete status |
+| Templates | Admin Panel → Design Settings → Template | Shows 7 templates |
+
+---
+
+## 📞 Support
+
+If you encounter any issues:
+1. Check which Part you're implementing
+2. Verify you copied the exact code
+3. Check for syntax errors
+4. Test each section individually
+5. Compare with backup if needed
+
+---
+
+## ✅ Success Indicators
+
+After implementing all parts, you should have:
+- ✅ `/uncategorized` works manually
+- ✅ Set time button functional
+- ✅ Batch operations show ✅ checkmarks
+- ✅ All 6 animations working (loading, processing, search, stats, start, contact)
+- ✅ Bot status in start message
+- ✅ 7 caption templates available
+- ✅ All existing features intact
+
+---
+
+## 🎉 Final Notes
+
+**Total Implementation Time:** ~1-1.5 hours
+**Difficulty Level:** Intermediate
+**Testing Time:** ~30 minutes
+
+Good luck with the implementation! 🚀
+
+All parts are ready to download and implement in order.
+
+
+also Add these New features:- 
+
+Add bulk user management commands
+Add export/import category structure
+Add video statistics per batch
+Add user activity heatmap
+Add scheduled broadcasts
